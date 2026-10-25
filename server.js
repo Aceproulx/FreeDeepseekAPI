@@ -17,7 +17,7 @@ const path = require('path');
 const readline = require('readline');
 const crypto = require('crypto');
 const events = require('events');
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const { solvePOW } = require('./lib/pow');
 const { loadDotEnv } = require('./lib/env');
 
@@ -180,7 +180,7 @@ function printBanner() {
 ██      ██   ██ ██      ██      ██   ██ ██      ██      ██      ██  ██
 ██      ██   ██ ███████ ███████ ██████  ███████ ███████ ███████ ██   ██
 
-   FreeDeepseekAPI — API-прокси для DeepSeek Web Chat
+   FreeDeepseekAPI — API Proxy for DeepSeek Web Chat
    ${formatWatermark()}
 `);
 }
@@ -532,8 +532,7 @@ function sweepIdleSessions(maxIdleMs = SESSION_TTL_MS * 2) {
 // solvePOW() lives in lib/pow (compiled-module cache + WASM-fetch timeout),
 // shared with client.js. Called as solvePOW(challenge, wasmUrl).
 
-// DeepSeek Web merged its “Быстрый” (Instant), “Эксперт” (Expert) and
-// “Распознавание” (Vision) modes into a single unified mode on 2026-09-10 and
+// DeepSeek Web merged its Instant, Expert and Vision modes into a single unified mode on 2026-09-10 and
 // retired V4 Pro on 2026-09-14 (#31). Every request now goes to the same
 // model_type; only the “DeepThink” (thinking_enabled) and “Search”
 // (search_enabled) toggles remain. The old aliases stay accepted so existing
@@ -3323,31 +3322,101 @@ async function runAuthScript() {
     return result.status === 0 && hasAuthConfig();
 }
 
+const PID_FILE = path.join(__dirname, 'server.pid');
+const LOG_FILE = process.env.DEEPSEEK_LOG_FILE || path.join(__dirname, 'server.log');
+
 function printStatus() {
     console.log(`\n${formatWatermark()}`);
-    console.log(`Auth: ${hasAuthConfig() ? '✅ OK' : '❌ не найден deepseek-auth.json'}`);
+    console.log(`Auth: ${hasAuthConfig() ? '✅ OK' : '❌ deepseek-auth.json not found'}`);
     console.log(`Auth source: ${process.env.DEEPSEEK_AUTH_DIR || DS_CONFIG_PATH}`);
-    console.log(`Аккаунты: ${accounts.length ? accounts.map(a => `${a.id}${a.cooldownUntil > Date.now() ? ' (cooldown)' : ''}`).join(', ') : 'нет'}`);
-    console.log(`Рабочие модели: ${SUPPORTED_MODEL_IDS.join(', ')}`);
-    console.log('Нерабочие/скрытые aliases: ' + Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported).join(', '));
+    console.log(`Accounts: ${accounts.length ? accounts.map(a => `${a.id}${a.cooldownUntil > Date.now() ? ' (cooldown)' : ''}`).join(', ') : 'none'}`);
+    console.log(`Active models: ${SUPPORTED_MODEL_IDS.join(', ')}`);
+    console.log('Inactive/hidden aliases: ' + Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported).join(', '));
     console.log('Capabilities: GET /v1/model-capabilities');
 }
 
-async function showStartupMenu() {
-    if (isTruthy(process.env.SKIP_ACCOUNT_MENU) || isTruthy(process.env.NON_INTERACTIVE)) {
-        if (!hasAuthConfig()) loadDeepSeekConfig({ fatal: true });
-        return true;
+function stopDaemon() {
+    if (fs.existsSync(PID_FILE)) {
+        try {
+            const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+            if (pid && !isNaN(pid)) {
+                process.kill(pid, 'SIGTERM');
+                console.log(`[DS-API] Stopped daemon process (PID: ${pid}).`);
+                try { fs.unlinkSync(PID_FILE); } catch {}
+                process.exit(0);
+            }
+        } catch (err) {
+            console.log(`[DS-API] Could not stop daemon PID (it may not be running): ${err.message}`);
+            try { fs.unlinkSync(PID_FILE); } catch {}
+            process.exit(1);
+        }
     }
+    console.log('[DS-API] No active daemon PID file found.');
+    process.exit(0);
+}
+
+function setupCtrlDHandler() {
+    if (!process.stdin.isTTY) return;
+
+    try {
+        readline.emitKeypressEvents(process.stdin);
+        process.stdin.setRawMode(true);
+        process.stdin.resume();
+
+        const onKeypress = (str, key) => {
+            // Ctrl+C -> Graceful exit
+            if ((key && key.ctrl && key.name === 'c') || str === '\x03') {
+                console.log('\n[DS-API] Stopping server...');
+                try { process.stdin.setRawMode(false); } catch {}
+                try { if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE); } catch {}
+                server.close(() => process.exit(0));
+                setTimeout(() => process.exit(0), 1000).unref();
+                return;
+            }
+            // Ctrl+D -> Daemon mode
+            if ((key && key.ctrl && key.name === 'd') || str === '\x04') {
+                try { process.stdin.setRawMode(false); } catch {}
+                process.stdin.removeListener('keypress', onKeypress);
+                process.stdin.pause();
+
+                console.log('\n[DS-API] Detaching and switching to daemon mode (background)...');
+                const logFd = fs.openSync(LOG_FILE, 'a');
+
+                server.close(() => {
+                    const childArgs = process.argv.slice(2).filter(a => !['--daemon', '-d', '--daemonized'].includes(a));
+                    const child = spawn(process.execPath, [__filename, ...childArgs, '--daemonized'], {
+                        detached: true,
+                        stdio: ['ignore', logFd, logFd],
+                        cwd: __dirname,
+                        env: { ...process.env, DAEMONIZED: '1' }
+                    });
+                    child.unref();
+                    try { fs.writeFileSync(PID_FILE, String(child.pid), 'utf8'); } catch {}
+                    console.log(`[DS-API] Switched to daemon mode (PID: ${child.pid}).`);
+                    console.log(`[DS-API] Logs are being written to: ${LOG_FILE}`);
+                    console.log(`[DS-API] To stop: npm run stop  or  kill ${child.pid}\n`);
+                    process.exit(0);
+                });
+            }
+        };
+
+        process.stdin.on('keypress', onKeypress);
+    } catch (e) {
+        // Safe fallback if raw mode unsupported
+    }
+}
+
+async function showStartupMenu() {
     while (true) {
         printStatus();
-        console.log('\n=== Меню ===');
+        console.log('\n=== Menu ===');
         console.log(`ForgetMeAI: ${FORGETMEAI_WATERMARK}`);
-        console.log('1 - Авторизоваться / обновить DeepSeek login');
-        console.log('2 - Импортировать auth-файл / cookies');
-        console.log('3 - Показать модели и статусы');
-        console.log('4 - Запустить прокси (по умолчанию)');
-        console.log('5 - Выход');
-        let choice = await prompt('Ваш выбор (Enter = 4): ');
+        console.log('1 - Log in / refresh DeepSeek login');
+        console.log('2 - Import auth file / cookies');
+        console.log('3 - Show models and statuses');
+        console.log('4 - Start proxy (default)');
+        console.log('5 - Exit');
+        let choice = await prompt('Your choice (Enter = 4): ');
         if (!choice) choice = '4';
         if (choice === '1') {
             await runAuthScript();
@@ -3356,10 +3425,10 @@ async function showStartupMenu() {
             loadDeepSeekConfig({ fatal: false });
         } else if (choice === '3') {
             console.log(JSON.stringify(ALL_MODEL_CAPABILITIES, null, 2));
-            await prompt('\nНажмите Enter, чтобы вернуться в меню...');
+            await prompt('\nPress Enter to return to menu...');
         } else if (choice === '4') {
             if (!hasAuthConfig()) {
-                console.log('Нужен deepseek-auth.json. Запустите пункт 1 или 2.');
+                console.log('deepseek-auth.json required. Please run option 1 or 2 first.');
                 continue;
             }
             return true;
@@ -3370,22 +3439,93 @@ async function showStartupMenu() {
 }
 
 async function main() {
+    const args = process.argv.slice(2);
+    if (args.includes('--help') || args.includes('-h')) {
+        console.log(`
+FreeDeepseekAPI — API Proxy for DeepSeek Web Chat
+
+Usage:
+  npm start               Start API proxy directly (terminal friendly)
+  npm run daemon          Start API proxy directly in background (daemon mode)
+  npm run stop            Stop running daemon instance
+  npm run auth            Authenticate / login via Chrome
+  npm run auth:import     Import cookies or deepseek-auth.json
+  npm run doctor          Run diagnostic checks
+
+Options:
+  --daemon, -d   Run as detached background daemon
+  --stop         Stop running background daemon process
+  --menu, -m     Open interactive menu
+  --help, -h     Show this help message
+
+In foreground mode:
+  Press Ctrl+D at any time to detach and send server to daemon mode.
+  Press Ctrl+C to stop the server.
+`);
+        process.exit(0);
+    }
+
+    if (args.includes('--stop')) {
+        return stopDaemon();
+    }
+
+    const isDaemonFlag = args.includes('--daemon') || args.includes('-d');
+    const isDaemonized = args.includes('--daemonized') || process.env.DAEMONIZED === '1';
+
+    if (isDaemonFlag && !isDaemonized) {
+        if (!hasAuthConfig()) {
+            console.error('\n[DS-API] ERROR: DeepSeek authentication not found (deepseek-auth.json missing).');
+            console.error('[DS-API] Run \'npm run auth\' or \'npm run auth:import\' before starting in daemon mode.\n');
+            process.exit(1);
+        }
+        const logFd = fs.openSync(LOG_FILE, 'a');
+        const childArgs = process.argv.slice(2).filter(a => !['--daemon', '-d'].includes(a));
+        const child = spawn(process.execPath, [__filename, ...childArgs, '--daemonized'], {
+            detached: true,
+            stdio: ['ignore', logFd, logFd],
+            cwd: __dirname,
+            env: { ...process.env, DAEMONIZED: '1' }
+        });
+        child.unref();
+        try { fs.writeFileSync(PID_FILE, String(child.pid), 'utf8'); } catch {}
+        console.log(`[DS-API] Started in daemon mode (PID: ${child.pid}).`);
+        console.log(`[DS-API] Logs are written to: ${LOG_FILE}`);
+        console.log(`[DS-API] Stop anytime with: npm run stop  or  kill ${child.pid}\n`);
+        process.exit(0);
+    }
+
     printBanner();
     requireProxyApiKey(PROXY_API_KEY, isTruthy(process.env.REQUIRE_PROXY_API_KEY));
     if (!isLoopbackHost(HOST) && !PROXY_API_KEY) {
         console.warn(`[DS-API] WARNING: HOST=${HOST} exposes the proxy without authentication. Set PROXY_API_KEY or bind to 127.0.0.1.`);
     }
-    const shouldStart = await showStartupMenu();
-    if (!shouldStart) process.exit(0);
+
+    const wantsMenu = args.includes('--menu') || args.includes('-m') || isTruthy(process.env.MENU);
+    if (wantsMenu) {
+        const shouldStart = await showStartupMenu();
+        if (!shouldStart) process.exit(0);
+    } else {
+        if (!hasAuthConfig()) {
+            console.error('\n[DS-API] ERROR: DeepSeek credentials not found (deepseek-auth.json missing).');
+            console.error('[DS-API] Please run:');
+            console.error('  npm run auth         # Login via browser');
+            console.error('  npm run auth:import  # Import existing cookies/auth file\n');
+            process.exit(1);
+        }
+        printStatus();
+    }
+
     server.on('error', (err) => {
         if (err.code === 'EADDRINUSE') console.error(`[DS-API] FATAL: port ${PORT} already in use. Set PORT=<other> or stop the other instance.`);
         else console.error('[DS-API] server error:', err);
         process.exit(1);
     });
+
     // Periodically evict idle sessions (unref'd so it never keeps the process alive).
     setInterval(sweepIdleSessions, 10 * 60 * 1000).unref();
+
     server.listen(PORT, HOST, () => {
-        console.log(`[DS-API] Server on http://${HOST}:${PORT} (multi-agent sessions enabled)`);
+        console.log(`\n[DS-API] Server on http://${HOST}:${PORT} (multi-agent sessions enabled)`);
         console.log(`[DS-API] ${formatWatermark()}`);
         console.log('[DS-API] POST /v1/chat/completions (OpenAI Chat Completions, stream=true|false)');
         console.log('[DS-API] POST /v1/messages — Anthropic Messages shim for Claude Code');
@@ -3395,6 +3535,13 @@ async function main() {
         console.log('[DS-API] GET  /v1/sessions — list active agent sessions');
         console.log('[DS-API] POST /reset-session?agent=<id> — reset agent session');
         console.log('[DS-API] POST /reset-session?agent=all — reset ALL sessions');
+
+        if (isDaemonized) {
+            try { fs.writeFileSync(PID_FILE, String(process.pid), 'utf8'); } catch {}
+        } else {
+            console.log('\n[DS-API] 💡 Press Ctrl+D to send to daemon mode (background) | Ctrl+C to stop');
+            setupCtrlDHandler();
+        }
     });
 }
 
@@ -3405,6 +3552,7 @@ if (require.main === module) {
     // Graceful shutdown: stop accepting, drain, then exit (force-exit after 10s).
     const shutdown = (sig) => {
         console.log(`[DS-API] ${sig} received — shutting down…`);
+        try { if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE); } catch {}
         server.close(() => process.exit(0));
         setTimeout(() => process.exit(0), 10000).unref();
     };

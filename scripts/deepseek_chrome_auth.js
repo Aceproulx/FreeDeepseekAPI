@@ -202,6 +202,18 @@ function resolveChromePath() {
         for (const c of candidates) {
             if (fs.existsSync(c)) return c;
         }
+    } else if (process.platform === 'linux') {
+        const candidates = [
+            '/usr/bin/google-chrome',
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
+            '/snap/bin/chromium',
+            '/usr/bin/brave-browser',
+        ];
+        for (const c of candidates) {
+            if (fs.existsSync(c)) return c;
+        }
     } else if (process.platform === 'darwin') {
         const candidates = [
             '/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
@@ -491,13 +503,13 @@ async function main() {
     await cdp.send('Network.enable');
 
     console.log(
-        '\n[auth] Chrome открыт. Войди в DeepSeek в ЭТОМ отдельном окне.',
+        '\n[auth] Chrome is open. Log into DeepSeek in THIS separate window.',
     );
     console.log(
-        '[auth] После логина отправь в DeepSeek короткое сообщение, например: ok',
+        '[auth] After login, send a short message in DeepSeek chat, e.g.: ok',
     );
     await ask(
-        '[auth] Когда залогинился и отправил тестовое сообщение — нажми ENTER здесь: ',
+        '[auth] Once logged in and test message sent — press ENTER here: ',
     );
 
     let auth = null;

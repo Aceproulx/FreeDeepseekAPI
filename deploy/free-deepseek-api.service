@@ -1,5 +1,5 @@
 # systemd unit for running FreeDeepseekAPI as a permanent service on a VPS.
-# Install steps: README → "Постоянный сервис на VPS (systemd)".
+# Install steps: README → "Permanent VPS Service (systemd)".
 [Unit]
 Description=FreeDeepseekAPI (OpenAI/Anthropic-compatible proxy for DeepSeek Web)
 After=network-online.target
